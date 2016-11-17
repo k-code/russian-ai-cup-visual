@@ -1,1 +1,3 @@
-javac -encoding UTF-8 *.java
+#!/bin/bash
+
+rm -rf ./*.class ./model/*.class

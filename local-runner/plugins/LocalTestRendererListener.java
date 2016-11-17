@@ -24,418 +24,125 @@ import java.util.concurrent.locks.ReentrantLock;
 import model.*;
 
 public final class LocalTestRendererListener {
-	private final static String LOGFILE_NAME = "visualizer-plugin.err"; 
-	private static void reportException(Exception exc)
-	{
-		try {
-			PrintWriter writer = new PrintWriter(new FileWriter(LOGFILE_NAME, true));
-			exc.printStackTrace(writer);
-			writer.close();
-		} catch (FileNotFoundException e1) {
-			return;
-		} catch (UnsupportedEncodingException e1) {
-			return;
-		} catch (IOException e1) {
-			return;
-		}
-	}
-	private final class Message
-	{
-		public final static String CIRCLE = "circle";
-		public final static String RECT = "rect";
-		public final static String ARC = "arc";
-		public final static String LINE = "line";
-		public final static String TEXT = "text";
-		public final static String FILL_CIRCLE = "fill_circle";
-		public final static String FILL_RECT = "fill_rect";
-		public final static String FILL_ARC = "fill_arc";
-		public final static String UNKNOWN = "unknown";
-		
-		private double x1, y1, x2, y2, radius, startAngle, arcAngle;
-		private Color color;
-		private String type, text;
-		
-		public Message(String line)
-		{
-			String[] tokens = line.split(" ");
-			int colorPos = 1;
-			type = tokens[0];
-			if (type.equals(CIRCLE) || type.equals(FILL_CIRCLE))
-			{
-				x1 = Double.parseDouble(tokens[1]);
-				y1 = Double.parseDouble(tokens[2]);
-				x2 = Double.parseDouble(tokens[3]);
-				colorPos = 4;
-			}
-			else if (type.equals(RECT) || type.equals(LINE) || type.equals(FILL_RECT))
-			{
-				x1 = Double.parseDouble(tokens[1]);
-				y1 = Double.parseDouble(tokens[2]);
-				x2 = Double.parseDouble(tokens[3]);
-				y2 = Double.parseDouble(tokens[4]);
-				colorPos = 5;
-			}
-			else if (type.equals(TEXT))
-			{
-				x1 = Double.parseDouble(tokens[1]);
-				y1 = Double.parseDouble(tokens[2]);
-				StringBuilder sb = new StringBuilder();
-				for (int i = 3; i < tokens.length - 3; i++)
-				{
-					sb.append(tokens[i]);
-					if (i < tokens.length - 4)
-					{
-						sb.append(" ");
-					}
-				}
-				text = sb.toString();
-				colorPos = tokens.length - 3;
-			}
-			else if (type.equals(ARC) || type.equals(FILL_ARC))
-			{
-				x1 = Double.parseDouble(tokens[1]);
-				y1 = Double.parseDouble(tokens[2]);
-				radius = Double.parseDouble(tokens[3]);
-				startAngle = -Double.parseDouble(tokens[4]);  // Graphics.drawArc() считает против часовой стрелки
-				arcAngle =   -Double.parseDouble(tokens[5]);  // Graphics.drawArc() считает против часовой стрелки
-				colorPos = 6;
-			}
-			else
-			{
-				type = UNKNOWN;
-				return;
-			}
-			
-			float r = Float.parseFloat(tokens[colorPos]);
-			float g = Float.parseFloat(tokens[colorPos + 1]);
-			float b = Float.parseFloat(tokens[colorPos + 2]);
-			color = new Color(r, g, b);
-		}
-		
-		public void draw(Graphics graphics, LocalTestRendererListener listner, boolean useAbsCoords)
-		{
-			if (type == UNKNOWN) return;
-			graphics.setColor(color);
-			if (type.equals(CIRCLE)) listner.drawCircle(x1, y1, x2, useAbsCoords);
-			if (type.equals(FILL_CIRCLE)) listner.fillCircle(x1, y1, x2, useAbsCoords);
-			if (type.equals(RECT)) listner.drawRect(x1, y1, x2 - x1, y2 - y1, useAbsCoords);
-			if (type.equals(ARC)) listner.drawArc(x1, y1, radius, startAngle, arcAngle, useAbsCoords);
-			if (type.equals(FILL_RECT)) listner.fillRect(x1, y1, x2 - x1, y2 - y1, useAbsCoords);
-			if (type.equals(FILL_ARC)) listner.fillArc(x1, y1, radius, startAngle, arcAngle, useAbsCoords);
-			if (type.equals(LINE)) listner.drawLine(x1, y1, x2, y2, useAbsCoords);
-			if (type.equals(TEXT)) listner.showText(x1, y1, text, useAbsCoords);
-		}
-	}
-
-    enum TargetQueue {PRE, POST, ABS, NONE};
-
-    private final class ThreadListener extends Thread
-    {
-    	public static final String BEGIN_PRE = "begin pre";
-    	public static final String END_PRE = "end pre";
-    	public static final String BEGIN_POST = "begin post";
-    	public static final String END_POST = "end post";
-        public static final String BEGIN_ABS = "begin abs";
-        public static final String END_ABS = "end abs";
-    	public static final String SYNC = "sync";
-    	public static final String ACKNOWLEDGE = "ack";
-
-    	private static final int BUFFER_SIZE_BYTES = 1 << 20;
-        
-    	private ServerSocket socket;
-    	private ArrayList<Message> messagesPre, messagesPost, messagesAbs, lastMessagesPre, lastMessagesPost, lastMessagesAbs;
-    	private TargetQueue queue;
-    	private Lock lock;
-    	private OutputStream outputStream;
-    	private OutputStreamWriter outputWriter;
-    	private SynchronousQueue<String> acknowledgeQueue;
-    	public ThreadListener(int port) throws IOException
-    	{
-    		socket = new ServerSocket(port);
-    		messagesPre = new ArrayList<Message>();
-    		messagesPost = new ArrayList<Message>();
-            messagesAbs = new ArrayList<Message>();
-            lastMessagesPre = new ArrayList<Message>();
-            lastMessagesPost = new ArrayList<Message>();
-            lastMessagesAbs = new ArrayList<Message>();
-
-    		queue = TargetQueue.NONE;
-    		lock = new ReentrantLock();
-    		outputStream = null;
-    		outputWriter = null;
-    		acknowledgeQueue = new SynchronousQueue<String>(true);
-    	}
-    	
-    	public boolean isReady()
-    	{
-    		return outputWriter != null;
-    	}
-    	
-    	public boolean syncronize(int tick) throws IOException, InterruptedException
-    	{
-    		outputWriter.write(SYNC + " " + tick + "\n");
-    		outputWriter.flush();
-    		outputStream.flush();
-    		return acknowledgeQueue.take().equals(ACKNOWLEDGE);
-    	}
-    	
-    	public void run()
-    	{
-    		try
-    		{
-				Socket client = socket.accept();
-				client.setSendBufferSize(BUFFER_SIZE_BYTES);
-				client.setReceiveBufferSize(BUFFER_SIZE_BYTES);
-				client.setTcpNoDelay(true);
-				BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
-				outputStream = client.getOutputStream();
-				outputWriter = new OutputStreamWriter(outputStream);
-	    		while (true)
-	    		{
-	    			String line = null;
-	    			try {
-	    				line = reader.readLine();
-	    			} catch (IOException e)
-	    			{
-	    				reportException(e);
-	    				return;
-	    			}
-	    			if (line == null) return;
-					lock.lock();
-					if (line.equals(ACKNOWLEDGE))
-					{
-						acknowledgeQueue.put(line);
-					}
-					else if (line.equals(BEGIN_PRE))
-	    			{
-                        // swap lists
-                        ArrayList<Message> tmp = lastMessagesPre;
-                        lastMessagesPre = messagesPre;
-                        messagesPre = tmp;
-
-	    	    		messagesPre.clear();
-	    	    		queue = TargetQueue.PRE;
-	    			}
-	    			else if (line.equals(END_PRE))
-	    			{
-	    				queue = TargetQueue.NONE;
-	    			}
-	    			else if (line.equals(BEGIN_POST))
-	    			{
-                        // swap lists
-                        ArrayList<Message> tmp = lastMessagesPost;
-                        lastMessagesPost = messagesPost;
-                        messagesPost = tmp;
-
-	    				messagesPost.clear();
-	    				queue = TargetQueue.POST;
-	    			}
-	    			else if (line.equals(END_POST))
-	    			{
-	    				queue = TargetQueue.NONE;
-	    			}
-                    else if (line.equals(BEGIN_ABS))
-                    {
-                        // swap lists
-                        ArrayList<Message> tmp = lastMessagesAbs;
-                        lastMessagesAbs = messagesAbs;
-                        messagesAbs = tmp;
-
-	    				messagesAbs.clear();
-                        queue = TargetQueue.ABS;
-                    }
-                    else if (line.equals(END_ABS))
-                    {
-	    				queue = TargetQueue.NONE;
-                    }
-	    			else if (queue != TargetQueue.NONE)
-	    			{
-	    				Message msg = null;
-	    				try
-	    				{
-	    					msg = new Message(line);
-	    				}
-	    				catch (Exception e)
-	    				{
-	    					reportException(e);
-	    				}
-	    				if (msg != null)
-	    				{
-                            switch (queue)
-                            {
-                                case POST:
-                                    messagesPost.add(msg);
-                                    break;
-                                case PRE:
-                                    messagesPre.add(msg);
-                                    break;
-                                case ABS:
-                                    messagesAbs.add(msg);
-                                    break;
-                            }
-	    				}
-	    			}
-					lock.unlock();
-	    		}
-    		}
-    		catch (Exception e)
-    		{
-    			reportException(e);
-    		}
-    	}
-		public void draw(Graphics graphics, LocalTestRendererListener listner, TargetQueue target)
-		{
-			ArrayList<Message> messages;
-			lock.lock();
-            switch (target)
-            {
-                case PRE:
-                    messages = lastMessagesPre;
-                    break;
-                case POST:
-                    messages = lastMessagesPost;
-                    break;
-                case ABS:
-                    messages = lastMessagesAbs;
-                    break;
-                default:
-                    lock.unlock();
-                    return;
-            }
-			
-			Color oldColor = graphics.getColor();
-			for (int i = 0; i < messages.size(); i++)
-			{
-				messages.get(i).draw(graphics, listner, target.equals(TargetQueue.ABS));
-			}
-			lock.unlock();
-			graphics.setColor(oldColor);
-		}
-
-    }
-    
-    enum SyncMode {DISABLED, ENABLED, AUTO};
+    private static final String LOGFILE_NAME = "visualizer-plugin.err";
     private static final String LOCAL_STRATEGY_NAME = "MyStrategy";
+    private static final SyncMode PLUGIN_DO_SYNC_DEFAULT = SyncMode.DISABLED;
+
+    private final int PLUGIN_PORT_NUMBER = 13579;
 
     private Graphics graphics;
-    private World world;
-    private Game game;
-
     private int canvasWidth;
     private int canvasHeight;
-
     private double left;
     private double top;
     private double width;
     private double height;
-    
-    private final int PLUGIN_PORT_NUMBER = 13579;
-    private final SyncMode PLUGIN_DO_SYNC_DEFAULT = SyncMode.DISABLED;
     private ThreadListener listener;
     private int port;
     private Font textFont;
     private SyncMode doSync;
-    
-    private void loadProperties() throws IOException
-    {
-    	Properties properties = new Properties();
-    	try
-    	{
-			properties.load(new FileInputStream("visualizer-plugin.properties"));
-    	}
-    	catch (FileNotFoundException e)
-    	{
-    		// no properties file, use defaults
-    		port = PLUGIN_PORT_NUMBER;
-    		return;
-    	}
 
-    	String portNo = properties.getProperty("plugin-port-number");
-    	port = Integer.parseInt(portNo);
-    	String doSyncStr = properties.getProperty("plugin-do-tick-sync");
-    	if (doSyncStr.equalsIgnoreCase("true"))
-    	{
-    		doSync = SyncMode.ENABLED;
-    	}
-    	else if (doSyncStr.equalsIgnoreCase("auto"))
-    	{
-    		doSync = SyncMode.AUTO;
-    	}
-    	else
-    	{
-    		doSync = SyncMode.DISABLED;
-    	}
+
+    public LocalTestRendererListener() {
+        File logfile = new File(LOGFILE_NAME);
+        if (logfile.exists()) {
+            logfile.delete();
+        }
+
+        // load defaults
+        port = PLUGIN_PORT_NUMBER;
+        doSync = PLUGIN_DO_SYNC_DEFAULT;
+        // now try loading from properties
+        try {
+            loadProperties();
+        } catch (Exception e1) {
+            reportException(e1);
+            return;
+        }
+
+        textFont = null;
+
+        try {
+            listener = new ThreadListener(port);
+            listener.start();
+        } catch (IOException e) {
+            reportException(e);
+            listener = null;
+        }
     }
-    
-    public LocalTestRendererListener()
-    {
-    	File logfile = new File(LOGFILE_NAME);
-    	if (logfile.exists())
-    	{
-    		logfile.delete();
-    	}
-	
-    	// load defaults
-    	port = PLUGIN_PORT_NUMBER;
-    	doSync = PLUGIN_DO_SYNC_DEFAULT;
-    	// now try loading from properties
-    	try {
-			loadProperties();
-		} catch (Exception e1) {
-			reportException(e1);
-			return;
-		}
-    	
-    	textFont = null;
-    	
-    	try {
-			listener = new ThreadListener(port);
-			listener.start();
-		} catch (IOException e) {
-			reportException(e);
-			listener = null;
-		}
+
+    private static void reportException(Exception exc) {
+        try {
+            PrintWriter writer = new PrintWriter(new FileWriter(LOGFILE_NAME, true));
+            exc.printStackTrace(writer);
+            writer.close();
+        } catch (FileNotFoundException e1) {
+            return;
+        } catch (UnsupportedEncodingException e1) {
+            return;
+        } catch (IOException e1) {
+            return;
+        }
+    }
+
+    private void loadProperties() throws IOException {
+        Properties properties = new Properties();
+        try {
+            properties.load(new FileInputStream("visualizer-plugin.properties"));
+        } catch (FileNotFoundException e) {
+            // no properties file, use defaults
+            port = PLUGIN_PORT_NUMBER;
+            return;
+        }
+
+        String portNo = properties.getProperty("plugin-port-number");
+        port = Integer.parseInt(portNo);
+        String doSyncStr = properties.getProperty("plugin-do-tick-sync");
+        if (doSyncStr.equalsIgnoreCase("true")) {
+            doSync = SyncMode.ENABLED;
+        } else if (doSyncStr.equalsIgnoreCase("auto")) {
+            doSync = SyncMode.AUTO;
+        } else {
+            doSync = SyncMode.DISABLED;
+        }
     }
 
     public void beforeDrawScene(Graphics graphics, World world, Game game, int canvasWidth, int canvasHeight,
                                 double left, double top, double width, double height) {
         updateFields(graphics, world, game, canvasWidth, canvasHeight, left, top, width, height);
-        if (listener != null)
-    	{
-        	if (doSync == SyncMode.AUTO)
-        	{
-        		doSync = SyncMode.ENABLED;
-        		for (int i = 0; i < world.getPlayers().length; i++)
-        		{
-        			if (world.getPlayers()[i].getName().startsWith(LOCAL_STRATEGY_NAME))
-        			{
-        				doSync = SyncMode.DISABLED;
-        				break;
-        			}
-        		}
-        	}
+        if (listener != null) {
+            if (doSync == SyncMode.AUTO) {
+                doSync = SyncMode.ENABLED;
+                for (int i = 0; i < world.getPlayers().length; i++) {
+                    if (world.getPlayers()[i].getName().startsWith(LOCAL_STRATEGY_NAME)) {
+                        doSync = SyncMode.DISABLED;
+                        break;
+                    }
+                }
+            }
 
-        	if (doSync == SyncMode.ENABLED)
-        	{
-        		while (!listener.isReady())
-    			{
-        			try {
-						Thread.sleep(50);
-					} catch (InterruptedException e) {
-						// TODO Auto-generated catch block
-						reportException(e);
-					}
-        			// do nothing waiting for debug client
-    			};
-	        	try {
-					listener.syncronize(world.getTickIndex());
-				} catch (IOException | InterruptedException e) {
-					reportException(e);
-				}
-        	}
-        	listener.draw(graphics, this, TargetQueue.PRE);
-    	}
+            if (doSync == SyncMode.ENABLED) {
+                while (!listener.isReady()) {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        // TODO Auto-generated catch block
+                        reportException(e);
+                    }
+                    // do nothing waiting for debug client
+                }
+                ;
+                try {
+                    listener.syncronize(world.getTickIndex());
+                } catch (IOException | InterruptedException e) {
+                    reportException(e);
+                }
+            }
+            listener.draw(graphics, this, TargetQueue.PRE);
+        }
     }
+
+    ;
 
     public void afterDrawScene(Graphics graphics, World world, Game game, int canvasWidth, int canvasHeight,
                                double left, double top, double width, double height) {
@@ -449,8 +156,8 @@ public final class LocalTestRendererListener {
     private void updateFields(Graphics graphics, World world, Game game, int canvasWidth, int canvasHeight,
                               double left, double top, double width, double height) {
         this.graphics = graphics;
-        this.world = world;
-        this.game = game;
+        World world1 = world;
+        Game game1 = game;
 
         this.canvasWidth = canvasWidth;
         this.canvasHeight = canvasHeight;
@@ -481,41 +188,39 @@ public final class LocalTestRendererListener {
 
         graphics.drawOval(topLeft.getX(), topLeft.getY(), size.getX(), size.getY());
     }
-    
-    private void showText(double X, double Y, String text, boolean useAbsCoords)
-    {
-    	Point2I position = useAbsCoords ? new Point2I(X, Y) : toCanvasPosition(X, Y);
-    	Font oldFont = graphics.getFont();
-    	if (textFont == null)
-    	{
-    		textFont = new Font(oldFont.getFamily(), Font.PLAIN, 10);
-    	}
-    	graphics.setFont(textFont);
-    	graphics.drawString(text, position.getX(), position.getY());
-    	graphics.setFont(oldFont);
+
+    private void showText(double X, double Y, String text, boolean useAbsCoords) {
+        Point2I position = useAbsCoords ? new Point2I(X, Y) : toCanvasPosition(X, Y);
+        Font oldFont = graphics.getFont();
+        if (textFont == null) {
+            textFont = new Font(oldFont.getFamily(), Font.PLAIN, 10);
+        }
+        graphics.setFont(textFont);
+        graphics.drawString(text, position.getX(), position.getY());
+        graphics.setFont(oldFont);
     }
 
-	private void fillArc(double centerX, double centerY, double radius, double startAngle, double arcAngle, boolean useAbsCoords) {
-		Point2I topLeft = useAbsCoords ? new Point2I(centerX - radius, centerY - radius) : toCanvasPosition(centerX - radius, centerY - radius);
-		Point2I size = useAbsCoords ? new Point2I(2.0D * radius, 2.0D * radius) : toCanvasOffset(2.0D * radius, 2.0D * radius);
+    private void fillArc(double centerX, double centerY, double radius, double startAngle, double arcAngle, boolean useAbsCoords) {
+        Point2I topLeft = useAbsCoords ? new Point2I(centerX - radius, centerY - radius) : toCanvasPosition(centerX - radius, centerY - radius);
+        Point2I size = useAbsCoords ? new Point2I(2.0D * radius, 2.0D * radius) : toCanvasOffset(2.0D * radius, 2.0D * radius);
 
-		// Convert from radians to degrees
-		int startAngleInt = (int) (Math.round(Math.toDegrees(startAngle)));
-		int arcAngleInt = (int) (Math.round(Math.toDegrees(arcAngle)));
+        // Convert from radians to degrees
+        int startAngleInt = (int) (Math.round(Math.toDegrees(startAngle)));
+        int arcAngleInt = (int) (Math.round(Math.toDegrees(arcAngle)));
 
-		graphics.fillArc(topLeft.getX(), topLeft.getY(), size.getX(), size.getY(), startAngleInt, arcAngleInt);
-	}
+        graphics.fillArc(topLeft.getX(), topLeft.getY(), size.getX(), size.getY(), startAngleInt, arcAngleInt);
+    }
 
-	private void drawArc(double centerX, double centerY, double radius, double startAngle, double arcAngle, boolean useAbsCoords) {
-		Point2I topLeft = useAbsCoords ? new Point2I(centerX - radius, centerY - radius) : toCanvasPosition(centerX - radius, centerY - radius);
-		Point2I size = useAbsCoords ? new Point2I(2.0D * radius, 2.0D * radius) : toCanvasOffset(2.0D * radius, 2.0D * radius);
+    private void drawArc(double centerX, double centerY, double radius, double startAngle, double arcAngle, boolean useAbsCoords) {
+        Point2I topLeft = useAbsCoords ? new Point2I(centerX - radius, centerY - radius) : toCanvasPosition(centerX - radius, centerY - radius);
+        Point2I size = useAbsCoords ? new Point2I(2.0D * radius, 2.0D * radius) : toCanvasOffset(2.0D * radius, 2.0D * radius);
 
-		// Convert from radians to degrees
-		int startAngleInt = (int) (Math.round(Math.toDegrees(startAngle)));
-		int arcAngleInt = (int) (Math.round(Math.toDegrees(arcAngle)));
+        // Convert from radians to degrees
+        int startAngleInt = (int) (Math.round(Math.toDegrees(startAngle)));
+        int arcAngleInt = (int) (Math.round(Math.toDegrees(arcAngle)));
 
-		graphics.drawArc(topLeft.getX(), topLeft.getY(), size.getX(), size.getY(), startAngleInt, arcAngleInt);
-	}
+        graphics.drawArc(topLeft.getX(), topLeft.getY(), size.getX(), size.getY(), startAngleInt, arcAngleInt);
+    }
 
     private void fillRect(double left, double top, double width, double height, boolean useAbsCoords) {
         Point2I topLeft = useAbsCoords ? new Point2I(left, top) : toCanvasPosition(left, top);
@@ -553,6 +258,10 @@ public final class LocalTestRendererListener {
         return new Point2I((x - left) * canvasWidth / width, (y - top) * canvasHeight / height);
     }
 
+    enum SyncMode {DISABLED, ENABLED, AUTO}
+
+    enum TargetQueue {PRE, POST, ABS, NONE}
+
     private static final class Point2I {
         private int x;
         private int y;
@@ -570,6 +279,14 @@ public final class LocalTestRendererListener {
         private Point2I() {
         }
 
+        private static int toInt(double value) {
+            @SuppressWarnings("NumericCastThatLosesPrecision") int intValue = (int) value;
+            if (abs((double) intValue - value) < 1.0D) {
+                return intValue;
+            }
+            throw new IllegalArgumentException("Can't convert double " + value + " to int.");
+        }
+
         public int getX() {
             return x;
         }
@@ -584,14 +301,6 @@ public final class LocalTestRendererListener {
 
         public void setY(int y) {
             this.y = y;
-        }
-        
-        private static int toInt(double value) {
-            @SuppressWarnings("NumericCastThatLosesPrecision") int intValue = (int) value;
-            if (abs((double) intValue - value) < 1.0D) {
-                return intValue;
-            }
-            throw new IllegalArgumentException("Can't convert double " + value + " to int.");
         }
     }
 
@@ -622,5 +331,233 @@ public final class LocalTestRendererListener {
         public void setY(double y) {
             this.y = y;
         }
+    }
+
+    private final class Message {
+        public final static String CIRCLE = "circle";
+        public final static String RECT = "rect";
+        public final static String ARC = "arc";
+        public final static String LINE = "line";
+        public final static String TEXT = "text";
+        public final static String FILL_CIRCLE = "fill_circle";
+        public final static String FILL_RECT = "fill_rect";
+        public final static String FILL_ARC = "fill_arc";
+        public final static String UNKNOWN = "unknown";
+
+        private double x1, y1, x2, y2, radius, startAngle, arcAngle;
+        private Color color;
+        private String type, text;
+
+        public Message(String line) {
+            String[] tokens = line.split(" ");
+            int colorPos = 1;
+            type = tokens[0];
+            if (type.equals(CIRCLE) || type.equals(FILL_CIRCLE)) {
+                x1 = Double.parseDouble(tokens[1]);
+                y1 = Double.parseDouble(tokens[2]);
+                x2 = Double.parseDouble(tokens[3]);
+                colorPos = 4;
+            } else if (type.equals(RECT) || type.equals(LINE) || type.equals(FILL_RECT)) {
+                x1 = Double.parseDouble(tokens[1]);
+                y1 = Double.parseDouble(tokens[2]);
+                x2 = Double.parseDouble(tokens[3]);
+                y2 = Double.parseDouble(tokens[4]);
+                colorPos = 5;
+            } else if (type.equals(TEXT)) {
+                x1 = Double.parseDouble(tokens[1]);
+                y1 = Double.parseDouble(tokens[2]);
+                StringBuilder sb = new StringBuilder();
+                for (int i = 3; i < tokens.length - 3; i++) {
+                    sb.append(tokens[i]);
+                    if (i < tokens.length - 4) {
+                        sb.append(" ");
+                    }
+                }
+                text = sb.toString();
+                colorPos = tokens.length - 3;
+            } else if (type.equals(ARC) || type.equals(FILL_ARC)) {
+                x1 = Double.parseDouble(tokens[1]);
+                y1 = Double.parseDouble(tokens[2]);
+                radius = Double.parseDouble(tokens[3]);
+                startAngle = -Double.parseDouble(tokens[4]);  // Graphics.drawArc() считает против часовой стрелки
+                arcAngle = -Double.parseDouble(tokens[5]);  // Graphics.drawArc() считает против часовой стрелки
+                colorPos = 6;
+            } else {
+                type = UNKNOWN;
+                return;
+            }
+
+            float r = Float.parseFloat(tokens[colorPos]);
+            float g = Float.parseFloat(tokens[colorPos + 1]);
+            float b = Float.parseFloat(tokens[colorPos + 2]);
+            color = new Color(r, g, b);
+        }
+
+        public void draw(Graphics graphics, LocalTestRendererListener listner, boolean useAbsCoords) {
+            if (type == UNKNOWN) return;
+            graphics.setColor(color);
+            if (type.equals(CIRCLE)) listner.drawCircle(x1, y1, x2, useAbsCoords);
+            if (type.equals(FILL_CIRCLE)) listner.fillCircle(x1, y1, x2, useAbsCoords);
+            if (type.equals(RECT)) listner.drawRect(x1, y1, x2 - x1, y2 - y1, useAbsCoords);
+            if (type.equals(ARC)) listner.drawArc(x1, y1, radius, startAngle, arcAngle, useAbsCoords);
+            if (type.equals(FILL_RECT)) listner.fillRect(x1, y1, x2 - x1, y2 - y1, useAbsCoords);
+            if (type.equals(FILL_ARC)) listner.fillArc(x1, y1, radius, startAngle, arcAngle, useAbsCoords);
+            if (type.equals(LINE)) listner.drawLine(x1, y1, x2, y2, useAbsCoords);
+            if (type.equals(TEXT)) listner.showText(x1, y1, text, useAbsCoords);
+        }
+    }
+
+    private final class ThreadListener extends Thread {
+        public static final String BEGIN_PRE = "begin pre";
+        public static final String END_PRE = "end pre";
+        public static final String BEGIN_POST = "begin post";
+        public static final String END_POST = "end post";
+        public static final String BEGIN_ABS = "begin abs";
+        public static final String END_ABS = "end abs";
+        public static final String SYNC = "sync";
+        public static final String ACKNOWLEDGE = "ack";
+
+        private static final int BUFFER_SIZE_BYTES = 1 << 20;
+
+        private ServerSocket socket;
+        private ArrayList<Message> messagesPre, messagesPost, messagesAbs, lastMessagesPre, lastMessagesPost, lastMessagesAbs;
+        private TargetQueue queue;
+        private Lock lock;
+        private OutputStream outputStream;
+        private OutputStreamWriter outputWriter;
+        private SynchronousQueue<String> acknowledgeQueue;
+
+        public ThreadListener(int port) throws IOException {
+            socket = new ServerSocket(port);
+            messagesPre = new ArrayList<Message>();
+            messagesPost = new ArrayList<Message>();
+            messagesAbs = new ArrayList<Message>();
+            lastMessagesPre = new ArrayList<Message>();
+            lastMessagesPost = new ArrayList<Message>();
+            lastMessagesAbs = new ArrayList<Message>();
+
+            queue = TargetQueue.NONE;
+            lock = new ReentrantLock();
+            outputStream = null;
+            outputWriter = null;
+            acknowledgeQueue = new SynchronousQueue<String>(true);
+        }
+
+        public boolean isReady() {
+            return outputWriter != null;
+        }
+
+        public boolean syncronize(int tick) throws IOException, InterruptedException {
+            outputWriter.write(SYNC + " " + tick + "\n");
+            outputWriter.flush();
+            outputStream.flush();
+            return acknowledgeQueue.take().equals(ACKNOWLEDGE);
+        }
+
+        public void run() {
+            try {
+                Socket client = socket.accept();
+                client.setSendBufferSize(BUFFER_SIZE_BYTES);
+                client.setReceiveBufferSize(BUFFER_SIZE_BYTES);
+                client.setTcpNoDelay(true);
+                BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
+                outputStream = client.getOutputStream();
+                outputWriter = new OutputStreamWriter(outputStream);
+                while (true) {
+                    String line = null;
+                    try {
+                        line = reader.readLine();
+                    } catch (IOException e) {
+                        reportException(e);
+                        return;
+                    }
+                    if (line == null) return;
+                    lock.lock();
+                    if (line.equals(ACKNOWLEDGE)) {
+                        acknowledgeQueue.put(line);
+                    } else if (line.equals(BEGIN_PRE)) {
+                        // swap lists
+                        ArrayList<Message> tmp = lastMessagesPre;
+                        lastMessagesPre = messagesPre;
+                        messagesPre = tmp;
+
+                        messagesPre.clear();
+                        queue = TargetQueue.PRE;
+                    } else if (line.equals(END_PRE)) {
+                        queue = TargetQueue.NONE;
+                    } else if (line.equals(BEGIN_POST)) {
+                        // swap lists
+                        ArrayList<Message> tmp = lastMessagesPost;
+                        lastMessagesPost = messagesPost;
+                        messagesPost = tmp;
+
+                        messagesPost.clear();
+                        queue = TargetQueue.POST;
+                    } else if (line.equals(END_POST)) {
+                        queue = TargetQueue.NONE;
+                    } else if (line.equals(BEGIN_ABS)) {
+                        // swap lists
+                        ArrayList<Message> tmp = lastMessagesAbs;
+                        lastMessagesAbs = messagesAbs;
+                        messagesAbs = tmp;
+
+                        messagesAbs.clear();
+                        queue = TargetQueue.ABS;
+                    } else if (line.equals(END_ABS)) {
+                        queue = TargetQueue.NONE;
+                    } else if (queue != TargetQueue.NONE) {
+                        Message msg = null;
+                        try {
+                            msg = new Message(line);
+                        } catch (Exception e) {
+                            reportException(e);
+                        }
+                        if (msg != null) {
+                            switch (queue) {
+                                case POST:
+                                    messagesPost.add(msg);
+                                    break;
+                                case PRE:
+                                    messagesPre.add(msg);
+                                    break;
+                                case ABS:
+                                    messagesAbs.add(msg);
+                                    break;
+                            }
+                        }
+                    }
+                    lock.unlock();
+                }
+            } catch (Exception e) {
+                reportException(e);
+            }
+        }
+
+        public void draw(Graphics graphics, LocalTestRendererListener listner, TargetQueue target) {
+            ArrayList<Message> messages;
+            lock.lock();
+            switch (target) {
+                case PRE:
+                    messages = lastMessagesPre;
+                    break;
+                case POST:
+                    messages = lastMessagesPost;
+                    break;
+                case ABS:
+                    messages = lastMessagesAbs;
+                    break;
+                default:
+                    lock.unlock();
+                    return;
+            }
+
+            Color oldColor = graphics.getColor();
+            for (int i = 0; i < messages.size(); i++) {
+                messages.get(i).draw(graphics, listner, target.equals(TargetQueue.ABS));
+            }
+            lock.unlock();
+            graphics.setColor(oldColor);
+        }
+
     }
 }
